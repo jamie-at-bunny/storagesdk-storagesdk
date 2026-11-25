@@ -9,7 +9,7 @@ section: adapters
 
 [Bunny Storage](https://docs.bunny.net/storage/s3) has an S3-compatible API for storage zones created with S3 compatibility turned on. This adapter uses `@storagesdk/adapters/s3` for object operations, with Bunny's endpoint and credentials filled in.
 
-On the S3 API the storage zone is the bucket, and its credentials can't create another zone. So the adapter maps each storagesdk `bucket` to a key prefix (`<bucket>/<key>`), and snapshots and forks land at sibling prefixes — the same layout as the [Bunny Storage](/adapters/bunny) adapter, which works on zones without S3 compatibility.
+On the S3 API the storage zone is the bucket, and its credentials can't create another zone. So the adapter maps each storagesdk `bucket` to a key prefix (`<bucket>/<key>`), and snapshots and forks go in sibling prefixes. The [Bunny Storage](/adapters/bunny) adapter uses the same layout and works on zones without S3 compatibility.
 
 ## Configuration
 
@@ -43,6 +43,7 @@ bunnyS3({
 - S3 compatibility is chosen when a zone is created and can't be turned on later.
 - Regions with an S3 endpoint: `de`, `uk`, `ny`, `la`, `sg`, `se`, `jh`, `syd`.
 - Snapshots and forks are seeded with server-side `CopyObject`.
+- `bucket` and fork names must be a single path segment (no `/`).
 - `forks.create` throws `Conflict` when the fork's prefix already holds objects.
 - Bunny's S3 API is in public preview.
 - `storage.raw` is the underlying `@aws-sdk/client-s3` `S3Client`, pointed at the zone.

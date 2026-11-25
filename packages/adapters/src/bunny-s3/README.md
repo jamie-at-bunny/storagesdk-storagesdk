@@ -52,7 +52,9 @@ Each snapshot and fork is a sibling key prefix in the same zone, seeded with ser
 
 The S3 adapter's sibling-bucket layout doesn't apply here, because a zone's credentials can't create another zone.
 
-A fork's name is its key prefix, and it shares the zone with every other logical bucket. `forks.create` throws `Conflict` when that prefix already holds objects, and `forks.delete` / `snapshots.delete` only remove prefixes this bucket created.
+A fork's name is its key prefix, and it shares the zone with every other logical bucket. Bucket and fork names must be a single path segment (no `/`, not `.` or `..`); anything else throws `InvalidArgument`. `forks.create` throws `Conflict` when that prefix already holds objects, and `forks.delete` / `snapshots.delete` only remove prefixes this bucket created.
+
+If a snapshot or fork fails partway (including when it's aborted), the partial copy is removed. If `snapshots.delete` / `forks.delete` can't remove the data, they throw and leave the manifest entry in place so you can retry.
 
 ## Environment variables
 

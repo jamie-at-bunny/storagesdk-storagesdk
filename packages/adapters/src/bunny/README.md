@@ -8,7 +8,7 @@ If your zone was created with S3 compatibility turned on, [`@storagesdk/adapters
 npm install @storagesdk/core @storagesdk/adapters
 ```
 
-No extra dependency — the adapter talks to the Edge Storage HTTP API directly with `fetch`.
+No extra dependency. The adapter calls the Edge Storage HTTP API with `fetch`.
 
 ```ts
 import { Storage } from '@storagesdk/core';
@@ -19,7 +19,7 @@ const storage = new Storage({
     zone: 'my-storage-zone',
     bucket: 'photos',
     region: 'de',
-    // accessKey defaults to process.env.BUNNY_STORAGE_ACCESS_KEY
+    accessKey: process.env.BUNNY_STORAGE_ACCESS_KEY,
     pullZone: 'my-zone.b-cdn.net', // for public url()
   }),
 });
@@ -41,23 +41,23 @@ If you only need one logical bucket per zone, pick any short name like `app`.
 interface BunnyConfig {
   zone: string;
   bucket: string;
-  accessKey?: string;
+  accessKey: string;
   region?: 'de' | 'uk' | 'ny' | 'la' | 'sg' | 'se' | 'br' | 'jh' | 'syd';
   endpoint?: string;
   pullZone?: string;
 }
 ```
 
-- `zone` — storage zone name. It's the first path segment of every request.
-- `bucket` — logical bucket, becomes the key prefix.
-- `accessKey` — the storage-zone **password** (read-write API key from the Bunny dashboard), **not** the account-level API key. Defaults to `process.env.BUNNY_STORAGE_ACCESS_KEY`.
-- `region` — primary storage region. Defaults to `de` (Falkenstein), served from the bare `storage.bunnycdn.com` host; every other region prefixes the host with its code (e.g. `ny.storage.bunnycdn.com`).
-- `endpoint` — override the storage origin entirely (e.g. a local mock). Takes precedence over `region`.
-- `pullZone` — pull-zone hostname for public file URLs (see [URLs](#urls)).
+- `zone`: storage zone name. It's the first path segment of every request.
+- `bucket`: logical bucket, becomes the key prefix.
+- `accessKey`: the storage zone password (the read-write key from the Bunny dashboard), not the account API key.
+- `region`: primary storage region. Defaults to `de` (Falkenstein), which is served from `storage.bunnycdn.com`. Other regions prefix the host with their code, for example `ny.storage.bunnycdn.com`.
+- `endpoint`: replaces the storage origin, for example with a local mock. Takes precedence over `region`.
+- `pullZone`: pull zone hostname for public file URLs (see [URLs](#urls)).
 
 ## Snapshots and forks
 
-Sibling-prefix convention — the same pattern as the Vercel Blob adapter. Each snapshot/fork is a new key prefix in the same zone, populated by copying every object. A `.storagesdk.metadata.json` manifest sits at the root of each prefix.
+Each snapshot or fork is a new key prefix in the same zone, filled by copying every object. The Vercel Blob adapter uses the same layout. A `.storagesdk.metadata.json` manifest sits at the root of each prefix.
 
 ```ts
 const snap = await storage.snapshots.create({ name: 'pre-migration' });
@@ -70,21 +70,24 @@ await fork.upload('new.jpg', blob);
 
 `forks.create` without `fromSnapshot` forks from the parent's live state.
 
-A fork's name is its key prefix, and it shares the zone with every other logical bucket. `forks.create` throws `Conflict` when that prefix already holds objects, and `forks.delete` / `snapshots.delete` only remove prefixes this bucket created.
+A fork's name is its key prefix, and it shares the zone with every other logical bucket. Bucket and fork names must be a single path segment (no `/`, not `.` or `..`); anything else throws `InvalidArgument`. `forks.create` throws `Conflict` when that prefix already holds objects, and `forks.delete` / `snapshots.delete` only remove prefixes this bucket created.
 
-Bunny has **no server-side copy**, so seeding a snapshot or fork streams every object's bytes through the client — cost is proportional to total bytes, not object count. The same is true of `copy` and `move`.
+Bunny has no server-side copy, so creating a snapshot or fork sends every object's bytes through the client, and the time it takes grows with total size. The same goes for `copy` and `move`. Each object is piped from the GET into the PUT without being read into memory, and up to 16 objects are copied at once.
+
+If a snapshot or fork fails partway (including when it's aborted), the partial copy is removed. If `snapshots.delete` / `forks.delete` can't remove the data, they throw and leave the manifest entry in place so you can retry.
 
 ## What this adapter doesn't preserve
 
 - **Custom metadata.** Bunny Edge Storage has no user-metadata field. `upload({ metadata })` silently drops the metadata. Use a sidecar object if you need per-object metadata.
 - **Presigned uploads.** Bunny has no presigned upload URL. `uploadUrl()` throws `StorageError` with code `NotSupported`.
+- **Server-side paging.** Bunny's directory listing returns a whole folder at a time with no pagination, so every `list()` call walks every folder under the prefix and then slices out one page. Paging through a large bucket costs one walk per page. Pass the narrowest `prefix` you can; a prefix ending in `/` starts the walk at that folder.
 
 ## URLs
 
 Bunny Edge Storage has no presigned-URL concept; public reads are served by a **Pull Zone** linked to the storage zone.
 
 - With `pullZone` set, `url()` returns the public CDN URL (`https://<pullZone>/<bucket>/<key>`), fetchable with no auth.
-- Without it, `url()` falls back to the storage URL, which requires the `AccessKey` header to fetch — useful for server-side access, not for handing to a browser.
+- Without it, `url()` falls back to the storage URL, which needs the `AccessKey` header to fetch. That works for server-side access but not in a browser.
 
 `url()` does not sign or expire the link; `expiresIn` is ignored.
 
@@ -101,7 +104,7 @@ await fetch(`${endpoint}/${zone}/photos/beach.jpg`, {
 });
 ```
 
-There's no client object to expose — the adapter is built directly on `fetch`.
+There's no client object to expose, since the adapter uses `fetch` directly.
 
 ```ts
 interface BunnyRaw {

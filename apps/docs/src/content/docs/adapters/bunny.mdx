@@ -31,7 +31,7 @@ const storage = new Storage({
 bunny({
   zone: string;        // storage zone name
   bucket: string;      // logical bucket, becomes a key prefix inside the zone
-  accessKey?: string;  // storage-zone password; defaults to BUNNY_STORAGE_ACCESS_KEY env var
+  accessKey: string;   // storage-zone password, not the account API key
   region?: 'de' | 'uk' | 'ny' | 'la' | 'sg' | 'se' | 'br' | 'jh' | 'syd';  // default 'de'
   endpoint?: string;   // override the storage origin
   pullZone?: string;   // pull-zone hostname for public url()
@@ -42,10 +42,12 @@ bunny({
 
 - No peer dependency.
 - `accessKey` is the storage-zone password, not the account API key.
-- Per-object `metadata` on `upload()` is **silently dropped** — the Edge Storage API has no user-metadata field.
-- `uploadUrl()` throws `NotSupported` — there are no presigned uploads.
+- Per-object `metadata` on `upload()` is dropped, because the Edge Storage API has no user metadata.
+- `uploadUrl()` throws `NotSupported` because there are no presigned uploads.
 - `url()` returns the Pull Zone URL when `pullZone` is set. Without it, it returns the storage URL, which needs the `AccessKey` header to fetch. Neither is signed, and `expiresIn` is ignored.
-- There is no server-side copy, so `copy`, `move`, and snapshot/fork seeding send every byte through the client.
+- There is no server-side copy, so `copy`, `move`, and snapshot/fork seeding stream every byte through the client. `ReadableStream` uploads are streamed too, not buffered.
+- Directory listings aren't paginated, so each `list()` call walks every folder under the prefix. Use the narrowest `prefix` you can.
+- `bucket` and fork names must be a single path segment (no `/`).
 - `forks.create` throws `Conflict` when the fork's prefix already holds objects.
 
 ## Compatibility
