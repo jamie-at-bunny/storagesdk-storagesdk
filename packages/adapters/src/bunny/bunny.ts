@@ -1,22 +1,15 @@
 import {
   type Adapter,
-  type BodyInput,
   bodyToBytes,
   checkSignal,
   defineAdapter,
   isInternalKey,
-  type ListOptions,
-  type ListResult,
   StorageError,
   type StorageItem,
   type StorageItemMeta,
-  type UploadOptions,
-  type UploadUrlOptions,
-  type UploadUrlResult,
-  type UrlOptions,
 } from '@storagesdk/core/adapter';
 import { asStorageError, BunnyHttpError } from './errors.js';
-import { siblings } from './siblings.js';
+import { assertLocation, inBatches, siblings } from './siblings.js';
 
 /**
  * Primary storage region of a Bunny storage zone. The `de` (Falkenstein)
@@ -48,45 +41,43 @@ const REGION_HOSTS: Readonly<Record<BunnyRegion, string>> = {
 
 export interface BunnyConfig {
   /**
-   * Storage zone name — the Bunny resource the credentials authorize. It
-   * is the first path segment of every Edge Storage request.
+   * Storage zone name. The credentials belong to this zone, and it is the
+   * first path segment of every Edge Storage request.
    */
   zone: string;
   /**
    * Logical bucket name. A Bunny storage zone is one flat key namespace,
    * so the adapter maps each storagesdk "bucket" to a key prefix
-   * (`<bucket>/<key>`) — multiple buckets coexist in one zone, and
-   * snapshots/forks live as sibling prefixes within the same zone.
+   * (`<bucket>/<key>`). Several buckets can share one zone, and
+   * snapshots and forks live as sibling prefixes in the same zone. Must be
+   * a single path segment (no `/`).
    */
   bucket: string;
   /**
-   * Storage-zone password (read-write API key). Falls back to the
-   * `BUNNY_STORAGE_ACCESS_KEY` env var. This is the per-zone password from
-   * the Bunny dashboard, not the account-level API key.
+   * Storage-zone password (read-write API key). This is the per-zone
+   * password from the Bunny dashboard, not the account-level API key.
    */
-  accessKey?: string;
+  accessKey: string;
   /** Primary storage region. Defaults to `de` (Falkenstein). */
   region?: BunnyRegion;
   /**
    * Override the storage endpoint origin entirely (e.g. a local mock or a
    * region not in {@link BunnyRegion}). Takes precedence over `region`.
-   * No trailing slash.
    */
   endpoint?: string;
   /**
    * Pull-zone hostname for public file URLs, e.g. `myzone.b-cdn.net` or a
-   * custom domain. Bunny Edge Storage has no presigned-URL concept; public
-   * reads are served by a linked Pull Zone. When set, `url()` returns the
-   * CDN URL; when omitted, `url()` falls back to the (auth-required)
-   * storage URL.
+   * custom domain. Bunny Edge Storage has no presigned URLs, so public
+   * reads go through a linked Pull Zone. When set, `url()` returns the CDN
+   * URL. Otherwise it returns the storage URL, which needs the `AccessKey`
+   * header to fetch.
    */
   pullZone?: string;
 }
 
 /**
- * Resolved connection settings exposed via `storage.raw` so consumers can
- * issue their own Bunny Edge Storage requests without re-deriving the host
- * and credentials.
+ * Connection settings exposed as `storage.raw`, for making your own Edge
+ * Storage requests with the same host and credentials.
  */
 export interface BunnyRaw {
   /** Storage endpoint origin, e.g. `https://storage.bunnycdn.com`. */
@@ -96,15 +87,6 @@ export interface BunnyRaw {
   /** Storage-zone password the adapter authenticates with. */
   readonly accessKey: string;
   /** Pull-zone host for public URLs, when configured. */
-  readonly pullZone?: string;
-}
-
-/** Internal request context shared by every (sub-)impl of one adapter. */
-interface Ctx {
-  readonly raw: BunnyRaw;
-  readonly host: string;
-  readonly zone: string;
-  readonly accessKey: string;
   readonly pullZone?: string;
 }
 
@@ -118,37 +100,37 @@ interface BunnyObject {
   Checksum: string | null;
 }
 
+/** A file found while walking the zone, keyed relative to the zone root. */
+interface ZoneFile {
+  zoneKey: string;
+  obj: BunnyObject;
+}
+
 /**
  * Adapter for Bunny Edge Storage.
  *
  * Implemented directly against the Edge Storage HTTP API (`fetch`, no SDK
  * dependency): `PUT`/`GET`/`DELETE` for objects, a `DESCRIBE` request for
- * `head`, and trailing-slash `GET` for directory listings. A Bunny storage
- * zone is a single flat namespace, so the adapter maps each storagesdk
- * bucket to a key prefix; snapshots live at `<bucket>-snapshot-<id>/` and
- * forks at `<forkName>/`, each carrying its own
- * `.storagesdk.metadata.json` manifest — the sibling-prefix convention
- * shared with the Vercel Blob adapter.
+ * `head`, and trailing-slash `GET` for directory listings. A storage zone
+ * is one flat namespace, so each storagesdk bucket is a key prefix.
+ * Snapshots live at `<bucket>-snapshot-<id>/` and forks at `<forkName>/`,
+ * each with its own `.storagesdk.metadata.json` manifest.
  *
- * **Gaps** (see the adapter compat matrix): Bunny has no user-metadata
- * field, so `upload`'s `metadata` is dropped; there is no presigned upload
- * URL (`uploadUrl` throws `NotSupported`); and there is no server-side
- * copy, so `copy`/`move` and snapshot/fork seeding stream bytes through
- * the client (O(bytes), not O(metadata)).
+ * Limits: Bunny has no user metadata, so `upload`'s `metadata` is dropped.
+ * There are no presigned upload URLs, so `uploadUrl` throws
+ * `NotSupported`. There is no server-side copy, so `copy`, `move`, and
+ * snapshot/fork seeding send every byte through the client. Directory
+ * listings aren't paginated, so `list` walks every folder under the
+ * prefix on each call.
  */
 export function bunny(config: BunnyConfig): Adapter<BunnyRaw> {
-  const accessKey =
-    config.accessKey ??
-    (typeof process !== 'undefined'
-      ? process.env.BUNNY_STORAGE_ACCESS_KEY
-      : undefined);
-  if (!accessKey) {
+  if (!config.accessKey) {
     throw new StorageError({
       code: 'InvalidArgument',
-      message:
-        'bunny adapter: accessKey is required (pass config.accessKey or set BUNNY_STORAGE_ACCESS_KEY)',
+      message: 'bunny adapter: accessKey is required',
     });
   }
+  assertLocation('bunny adapter: bucket', config.bucket);
   const regionHost = REGION_HOSTS[config.region ?? 'de'];
   if (config.endpoint === undefined && regionHost === undefined) {
     throw new StorageError({
@@ -156,437 +138,199 @@ export function bunny(config: BunnyConfig): Adapter<BunnyRaw> {
       message: `bunny adapter: unknown region ${config.region} (expected one of ${Object.keys(REGION_HOSTS).join(', ')})`,
     });
   }
-  const host = (config.endpoint ?? `https://${regionHost}`).replace(/\/$/, '');
   const raw: BunnyRaw = {
-    endpoint: host,
+    endpoint: (config.endpoint ?? `https://${regionHost}`).replace(/\/+$/, ''),
     zone: config.zone,
-    accessKey,
+    accessKey: config.accessKey,
     ...(config.pullZone !== undefined ? { pullZone: config.pullZone } : {}),
   };
-  const ctx: Ctx = {
-    raw,
-    host,
-    zone: config.zone,
-    accessKey,
-    ...(config.pullZone !== undefined ? { pullZone: config.pullZone } : {}),
-  };
-  return defineAdapter<BunnyRaw>(impl(ctx, config.bucket));
+  return defineAdapter<BunnyRaw>(impl(raw, config.bucket));
 }
+
+/** A request body `fetch` accepts. */
+type Body = NonNullable<RequestInit['body']>;
 
 /** Encode a slash-delimited key per segment, preserving a trailing slash. */
 function encodePath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
 }
 
-/** Compose a logical-bucket key into a zone-relative key. */
-const bucketKey = (bucket: string, key: string): string => `${bucket}/${key}`;
+/** Storage URL for a zone-relative key or (trailing-slash) directory. */
+const storageUrl = (raw: BunnyRaw, zoneKey: string): string =>
+  `${raw.endpoint}/${raw.zone}/${encodePath(zoneKey)}`;
 
-/** Full object URL for a zone-relative key. */
-const objUrl = (ctx: Ctx, zoneKey: string): string =>
-  `${ctx.host}/${ctx.zone}/${encodePath(zoneKey)}`;
+/** Media type of a response, without parameters. */
+const contentTypeOf = (res: Response): string =>
+  res.headers.get('content-type')?.split(';')[0]?.trim() ||
+  'application/octet-stream';
 
-const authHeaders = (ctx: Ctx): Record<string, string> => ({
-  AccessKey: ctx.accessKey,
-});
-
-/** GET one directory level. Returns `[]` for a not-yet-existing folder. */
-async function listDir(
-  ctx: Ctx,
-  zoneDir: string,
-  signal: AbortSignal | undefined
-): Promise<BunnyObject[]> {
-  const res = await fetch(`${ctx.host}/${ctx.zone}/${encodePath(zoneDir)}`, {
-    method: 'GET',
-    headers: { ...authHeaders(ctx), Accept: 'application/json' },
-    ...(signal ? { signal } : {}),
-  });
-  if (res.status === 404) return [];
-  if (!res.ok) {
+/**
+ * Send one Edge Storage request. Throws `BunnyHttpError` on a non-ok
+ * status. With `allowNotFound`, a 404 is returned instead and the caller
+ * checks `res.status`.
+ */
+async function send(
+  raw: BunnyRaw,
+  method: string,
+  zoneKey: string,
+  opts: {
+    signal?: AbortSignal | undefined;
+    headers?: Record<string, string>;
+    body?: Body;
+    allowNotFound?: boolean;
+  } = {}
+): Promise<Response> {
+  const init: RequestInit & { duplex?: 'half' } = {
+    method,
+    headers: { AccessKey: raw.accessKey, ...opts.headers },
+    ...(opts.body !== undefined ? { body: opts.body, duplex: 'half' } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  };
+  const res = await fetch(storageUrl(raw, zoneKey), init);
+  if (!res.ok && !(opts.allowNotFound && res.status === 404)) {
+    await res.body?.cancel();
     throw new BunnyHttpError(
       res.status,
-      `bunny: list ${zoneDir} (${res.status})`
+      `bunny: ${method} ${zoneKey} (${res.status})`
     );
   }
-  return (await res.json()) as BunnyObject[];
+  return res;
 }
 
-/** Fetch the bytes + content type of a zone-relative key (no range). */
-async function getBytes(
-  ctx: Ctx,
+/**
+ * PUT a body to a zone-relative key. Bunny auto-creates parent folders and
+ * accepts a streamed body, so a `ReadableStream` isn't read into memory.
+ */
+async function put(
+  raw: BunnyRaw,
   zoneKey: string,
-  signal: AbortSignal | undefined
-): Promise<{ bytes: Uint8Array<ArrayBuffer>; contentType: string }> {
-  const res = await fetch(objUrl(ctx, zoneKey), {
-    method: 'GET',
-    headers: authHeaders(ctx),
-    ...(signal ? { signal } : {}),
-  });
-  if (!res.ok) {
-    throw new BunnyHttpError(
-      res.status,
-      `bunny: get ${zoneKey} (${res.status})`
-    );
-  }
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  const contentType =
-    res.headers.get('content-type')?.split(';')[0]?.trim() ||
-    'application/octet-stream';
-  return { bytes, contentType };
-}
-
-/** PUT bytes to a zone-relative key. Bunny auto-creates parent folders. */
-async function putBytes(
-  ctx: Ctx,
-  zoneKey: string,
-  bytes: Uint8Array,
+  body: Body,
   contentType: string,
   signal: AbortSignal | undefined
 ): Promise<void> {
-  const res = await fetch(objUrl(ctx, zoneKey), {
-    method: 'PUT',
+  // Bunny stores the Content-Type header as sent unless
+  // Override-Content-Type is set. Like the official SDK, send
+  // octet-stream and put the real type in the override.
+  await send(raw, 'PUT', zoneKey, {
+    signal,
+    body,
     headers: {
-      ...authHeaders(ctx),
-      // Bunny stores the literal Content-Type unless an override is given;
-      // mirror the official SDK's convention of declaring octet-stream and
-      // overriding to the real type.
       'Content-Type': 'application/octet-stream',
       'Override-Content-Type': contentType,
     },
-    body: bytes,
-    ...(signal ? { signal } : {}),
   });
-  if (!res.ok) {
-    throw new BunnyHttpError(
-      res.status,
-      `bunny: put ${zoneKey} (${res.status})`
-    );
-  }
 }
 
-/** DELETE a zone-relative key. 404 is a no-op (matches S3/fs). */
-async function deleteKey(
-  ctx: Ctx,
-  zoneKey: string,
+/** Copy one object by piping its GET response body into a PUT. */
+async function copyObject(
+  raw: BunnyRaw,
+  fromKey: string,
+  toKey: string,
   signal: AbortSignal | undefined
 ): Promise<void> {
-  const res = await fetch(objUrl(ctx, zoneKey), {
-    method: 'DELETE',
-    headers: authHeaders(ctx),
-    ...(signal ? { signal } : {}),
-  });
-  if (!res.ok && res.status !== 404) {
-    throw new BunnyHttpError(
-      res.status,
-      `bunny: delete ${zoneKey} (${res.status})`
+  const res = await send(raw, 'GET', fromKey, { signal });
+  try {
+    await put(
+      raw,
+      toKey,
+      res.body ?? new Uint8Array(),
+      contentTypeOf(res),
+      signal
     );
+  } catch (err) {
+    await res.body?.cancel().catch(() => {});
+    throw err;
   }
 }
 
 /**
- * Recursively delete a sibling prefix. Bunny's DELETE on a trailing-slash
- * path removes the directory and everything under it in one call.
- * Best-effort: used for snapshot/fork teardown and create-failure rollback.
+ * Walk every file under the zone directory `dir` (which ends in `/`),
+ * one directory level per request. Yields each level's files together so
+ * callers can work on them in batches.
  */
-async function destroySibling(
-  ctx: Ctx,
+async function* walk(
+  raw: BunnyRaw,
+  dir: string,
+  signal: AbortSignal | undefined
+): AsyncGenerator<ZoneFile[]> {
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    const res = await send(raw, 'GET', current, {
+      signal,
+      headers: { Accept: 'application/json' },
+      allowNotFound: true,
+    });
+    if (res.status === 404) continue;
+    const files: ZoneFile[] = [];
+    for (const obj of (await res.json()) as BunnyObject[]) {
+      if (obj.IsDirectory) {
+        stack.push(`${current}${obj.ObjectName}/`);
+      } else {
+        files.push({ zoneKey: `${current}${obj.ObjectName}`, obj });
+      }
+    }
+    yield files;
+  }
+}
+
+/**
+ * Copy every object under `from/` to `to/`, skipping the manifest since
+ * the destination writes its own. Bunny has no server-side copy, so the
+ * bytes pass through the client.
+ */
+async function copyAll(
+  raw: BunnyRaw,
+  from: string,
+  to: string,
+  signal: AbortSignal | undefined
+): Promise<void> {
+  const base = `${from}/`;
+  for await (const files of walk(raw, base, signal)) {
+    const relative = files
+      .map(({ zoneKey }) => zoneKey.slice(base.length))
+      .filter((key) => !isInternalKey(key));
+    await inBatches(relative, (key) =>
+      copyObject(raw, `${base}${key}`, `${to}/${key}`, signal)
+    );
+  }
+}
+
+/** Whether anything is stored directly under `prefix/`. */
+async function inUse(
+  raw: BunnyRaw,
+  prefix: string,
+  signal: AbortSignal | undefined
+): Promise<boolean> {
+  const res = await send(raw, 'GET', `${prefix}/`, {
+    signal,
+    headers: { Accept: 'application/json' },
+    allowNotFound: true,
+  });
+  if (res.status === 404) return false;
+  return ((await res.json()) as BunnyObject[]).length > 0;
+}
+
+/**
+ * Remove a sibling prefix. Bunny's DELETE on a trailing-slash path removes
+ * the directory and everything under it in one call. A missing directory
+ * counts as removed.
+ */
+async function destroy(
+  raw: BunnyRaw,
   prefix: string,
   signal: AbortSignal | undefined
 ): Promise<void> {
-  try {
-    await fetch(`${ctx.host}/${ctx.zone}/${encodePath(`${prefix}/`)}`, {
-      method: 'DELETE',
-      headers: authHeaders(ctx),
-      ...(signal ? { signal } : {}),
-    });
-  } catch {
-    /* best-effort */
-  }
+  await send(raw, 'DELETE', `${prefix}/`, { signal, allowNotFound: true });
 }
 
-/**
- * Copy every object under `fromBucket` to `toBucket`, streaming bytes
- * through the client (Bunny has no server-side copy). Walks the source one
- * directory level at a time and skips the manifest — the destination
- * writes its own.
- */
-async function copyAllBlobs(
-  ctx: Ctx,
-  fromBucket: string,
-  toBucket: string,
-  signal: AbortSignal | undefined
-): Promise<void> {
-  const base = `${fromBucket}/`;
-  const stack: string[] = [base];
-  while (stack.length > 0) {
-    const dir = stack.pop() as string;
-    const entries = await listDir(ctx, dir, signal);
-    for (const e of entries) {
-      if (e.IsDirectory) {
-        stack.push(`${dir}${e.ObjectName}/`);
-        continue;
-      }
-      const zoneKey = `${dir}${e.ObjectName}`;
-      const relative = zoneKey.slice(base.length);
-      if (isInternalKey(relative)) continue;
-      const { bytes, contentType } = await getBytes(ctx, zoneKey, signal);
-      await putBytes(
-        ctx,
-        `${toBucket}/${relative}`,
-        bytes,
-        contentType,
-        signal
-      );
-    }
-  }
-}
-
-function impl(ctx: Ctx, bucketName: string): Adapter<BunnyRaw> {
-  const zoneKeyOf = (key: string): string => bucketKey(bucketName, key);
-
-  const objectToMeta = (obj: BunnyObject, key: string): StorageItemMeta => ({
-    path: key,
-    size: obj.Length ?? 0,
-    contentType: obj.ContentType || 'application/octet-stream',
-    etag: obj.Checksum ?? '',
-    lastModified: obj.LastChanged ? new Date(obj.LastChanged) : new Date(0),
-  });
-
-  /**
-   * Walk the objects that can match `prefix`, keyed relative to this
-   * bucket. Starts at the deepest folder the prefix names, so listing
-   * `a/b/` doesn't walk the rest of the bucket.
-   */
-  const walkKeys = async (
-    prefix: string,
-    signal: AbortSignal | undefined
-  ): Promise<Array<{ key: string; obj: BunnyObject }>> => {
-    const base = `${bucketName}/`;
-    const out: Array<{ key: string; obj: BunnyObject }> = [];
-    const stack: string[] = [
-      `${base}${prefix.slice(0, prefix.lastIndexOf('/') + 1)}`,
-    ];
-    while (stack.length > 0) {
-      const dir = stack.pop() as string;
-      const entries = await listDir(ctx, dir, signal);
-      for (const e of entries) {
-        if (e.IsDirectory) {
-          stack.push(`${dir}${e.ObjectName}/`);
-        } else {
-          out.push({ key: `${dir}${e.ObjectName}`.slice(base.length), obj: e });
-        }
-      }
-    }
-    return out;
-  };
-
-  const doDownload = async (
-    key: string,
-    opts:
-      | { signal?: AbortSignal; range?: { offset: number; length: number } }
-      | undefined
-  ): Promise<StorageItem> => {
-    const rangeHeader =
-      opts?.range !== undefined
-        ? {
-            Range: `bytes=${opts.range.offset}-${opts.range.offset + opts.range.length - 1}`,
-          }
-        : undefined;
-    const res = await fetch(objUrl(ctx, zoneKeyOf(key)), {
-      method: 'GET',
-      headers: { ...authHeaders(ctx), ...(rangeHeader ?? {}) },
-      ...(opts?.signal ? { signal: opts.signal } : {}),
-    });
-    if (!res.ok) {
-      throw new BunnyHttpError(
-        res.status,
-        `bunny: download ${key} (${res.status})`
-      );
-    }
-    let body = new Uint8Array(await res.arrayBuffer());
-    if (opts?.range && res.status !== 206) {
-      // Server ignored Range and returned the whole object — slice locally.
-      const { offset, length } = opts.range;
-      body = sliceBytes(body, offset, offset + length);
-    }
-    const contentType =
-      res.headers.get('content-type')?.split(';')[0]?.trim() ||
-      'application/octet-stream';
-    const lastMod = res.headers.get('last-modified');
-    return {
-      path: key,
-      size: body.byteLength,
-      contentType,
-      etag: res.headers.get('etag') ?? '',
-      lastModified: lastMod ? new Date(lastMod) : new Date(0),
-      body,
-    };
-  };
-
-  return {
-    name: 'bunny',
-    raw: ctx.raw,
-
-    async upload(
-      key: string,
-      body: BodyInput,
-      opts?: UploadOptions
-    ): Promise<StorageItemMeta> {
-      checkSignal(opts?.signal);
-      // Bunny has no user-metadata field; `opts.metadata` is dropped
-      // (documented in the compat matrix).
-      const bytes = await bodyToBytes(body);
-      const contentType = opts?.contentType ?? 'application/octet-stream';
-      try {
-        await putBytes(ctx, zoneKeyOf(key), bytes, contentType, opts?.signal);
-        // Bunny's PUT response carries no object metadata; synthesize from
-        // inputs. `head`/`download` return the server's etag + mtime later.
-        return {
-          path: key,
-          size: bytes.byteLength,
-          contentType,
-          etag: '',
-          lastModified: new Date(),
-        };
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async download(key, opts): Promise<StorageItem> {
-      checkSignal(opts?.signal);
-      try {
-        return await doDownload(key, opts);
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async head(key, opts): Promise<StorageItemMeta> {
-      checkSignal(opts?.signal);
-      try {
-        // Bunny exposes per-object metadata via a `DESCRIBE` request on the
-        // object path — no parent listing required.
-        const res = await fetch(objUrl(ctx, zoneKeyOf(key)), {
-          method: 'DESCRIBE',
-          headers: { ...authHeaders(ctx), Accept: 'application/json' },
-          ...(opts?.signal ? { signal: opts.signal } : {}),
-        });
-        if (!res.ok) {
-          throw new BunnyHttpError(
-            res.status,
-            `bunny: head ${key} (${res.status})`
-          );
-        }
-        const obj = (await res.json()) as BunnyObject;
-        if (obj.IsDirectory) {
-          throw new StorageError({
-            code: 'NotFound',
-            message: `bunny adapter: ${key} is a directory`,
-          });
-        }
-        return objectToMeta(obj, key);
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async list(opts?: ListOptions): Promise<ListResult> {
-      checkSignal(opts?.signal);
-      const prefix = opts?.prefix ?? '';
-      const limit = opts?.limit ?? 1000;
-      const cursor = opts?.cursor ?? '';
-      try {
-        const all = await walkKeys(prefix, opts?.signal);
-        const matching = all
-          .filter(
-            ({ key }) =>
-              !isInternalKey(key) && key.startsWith(prefix) && key > cursor
-          )
-          .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-        const page = matching.slice(0, limit);
-        const items = page.map(({ key, obj }) => objectToMeta(obj, key));
-        const hasMore = matching.length > limit;
-        const last = page[page.length - 1];
-        return hasMore && last !== undefined
-          ? { items, cursor: last.key }
-          : { items };
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async delete(key, opts): Promise<void> {
-      checkSignal(opts?.signal);
-      try {
-        await deleteKey(ctx, zoneKeyOf(key), opts?.signal);
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async copy(from, to, opts): Promise<void> {
-      checkSignal(opts?.signal);
-      // No server-side copy on Bunny — download the source and re-upload.
-      try {
-        const { bytes, contentType } = await getBytes(
-          ctx,
-          zoneKeyOf(from),
-          opts?.signal
-        );
-        await putBytes(ctx, zoneKeyOf(to), bytes, contentType, opts?.signal);
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async move(from, to, opts): Promise<void> {
-      checkSignal(opts?.signal);
-      // copy + delete. Not atomic — a failure after the copy may leave both
-      // keys present. Matches the documented contract.
-      try {
-        const { bytes, contentType } = await getBytes(
-          ctx,
-          zoneKeyOf(from),
-          opts?.signal
-        );
-        await putBytes(ctx, zoneKeyOf(to), bytes, contentType, opts?.signal);
-        await deleteKey(ctx, zoneKeyOf(from), opts?.signal);
-      } catch (err) {
-        throw asStorageError(err);
-      }
-    },
-
-    async url(key, opts?: UrlOptions): Promise<string> {
-      checkSignal(opts?.signal);
-      const zoneKey = zoneKeyOf(key);
-      // Public access is served by a linked Pull Zone. With one configured
-      // the CDN URL is publicly fetchable; without it we return the storage
-      // URL, which requires the `AccessKey` header to fetch (not public).
-      if (ctx.pullZone) {
-        return `https://${ctx.pullZone}/${encodePath(zoneKey)}`;
-      }
-      return objUrl(ctx, zoneKey);
-    },
-
-    async uploadUrl(_key, _opts?: UploadUrlOptions): Promise<UploadUrlResult> {
-      throw new StorageError({
-        code: 'NotSupported',
-        message:
-          'bunny adapter: uploadUrl is not supported (Bunny Edge Storage has no presigned upload URL).',
-      });
-    },
-
-    ...siblings<BunnyRaw>(
-      {
-        at: (bucket) => impl(ctx, bucket),
-        copyAll: (from, to, signal) => copyAllBlobs(ctx, from, to, signal),
-        destroy: (prefix, signal) => destroySibling(ctx, prefix, signal),
-        asStorageError,
-      },
-      bucketName
-    ),
-  };
-}
+const toMeta = (obj: BunnyObject, path: string): StorageItemMeta => ({
+  path,
+  size: obj.Length ?? 0,
+  contentType: obj.ContentType || 'application/octet-stream',
+  etag: obj.Checksum ?? '',
+  lastModified: obj.LastChanged ? new Date(obj.LastChanged) : new Date(0),
+});
 
 /** Copy a byte slice into a fresh `ArrayBuffer`-backed `Uint8Array`. */
 function sliceBytes(
@@ -598,4 +342,189 @@ function sliceBytes(
   const out = new Uint8Array(new ArrayBuffer(len));
   out.set(u8.subarray(start, start + len));
   return out;
+}
+
+/** Run `fn`, mapping anything it throws to a `StorageError`. */
+async function mapped<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    throw asStorageError(err);
+  }
+}
+
+function impl(raw: BunnyRaw, bucket: string): Adapter<BunnyRaw> {
+  const base = `${bucket}/`;
+  const zoneKeyOf = (key: string): string => `${base}${key}`;
+
+  return {
+    name: 'bunny',
+    raw,
+
+    upload: (key, body, opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        // Bunny has no user metadata, so `opts.metadata` is dropped. The
+        // compat matrix in the README says so.
+        const contentType = opts?.contentType ?? 'application/octet-stream';
+        let size: number;
+        if (body instanceof ReadableStream) {
+          // Stream the body through, counting bytes for the result.
+          size = 0;
+          const counted = body.pipeThrough(
+            new TransformStream<Uint8Array, Uint8Array>({
+              transform(chunk, controller) {
+                size += chunk.byteLength;
+                controller.enqueue(chunk);
+              },
+            })
+          );
+          await put(raw, zoneKeyOf(key), counted, contentType, opts?.signal);
+        } else {
+          const bytes = await bodyToBytes(body);
+          size = bytes.byteLength;
+          await put(raw, zoneKeyOf(key), bytes, contentType, opts?.signal);
+        }
+        // Bunny's PUT response has no object metadata, so build it from
+        // the inputs. `head` and `download` return the real etag and mtime.
+        return {
+          path: key,
+          size,
+          contentType,
+          etag: '',
+          lastModified: new Date(),
+        };
+      }),
+
+    download: (key, opts) =>
+      mapped(async (): Promise<StorageItem> => {
+        checkSignal(opts?.signal);
+        const range = opts?.range;
+        const res = await send(raw, 'GET', zoneKeyOf(key), {
+          signal: opts?.signal,
+          ...(range !== undefined
+            ? {
+                headers: {
+                  Range: `bytes=${range.offset}-${range.offset + range.length - 1}`,
+                },
+              }
+            : {}),
+        });
+        let body = new Uint8Array(await res.arrayBuffer());
+        if (range !== undefined && res.status !== 206) {
+          // The server ignored Range and sent the whole object, so slice it here.
+          body = sliceBytes(body, range.offset, range.offset + range.length);
+        }
+        const lastModified = res.headers.get('last-modified');
+        return {
+          path: key,
+          size: body.byteLength,
+          contentType: contentTypeOf(res),
+          etag: res.headers.get('etag') ?? '',
+          lastModified: lastModified ? new Date(lastModified) : new Date(0),
+          body,
+        };
+      }),
+
+    head: (key, opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        // `DESCRIBE` on the object path returns its metadata directly.
+        const res = await send(raw, 'DESCRIBE', zoneKeyOf(key), {
+          signal: opts?.signal,
+          headers: { Accept: 'application/json' },
+        });
+        const obj = (await res.json()) as BunnyObject;
+        if (obj.IsDirectory) {
+          throw new StorageError({
+            code: 'NotFound',
+            message: `bunny adapter: ${key} is a directory`,
+          });
+        }
+        return toMeta(obj, key);
+      }),
+
+    list: (opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        const prefix = opts?.prefix ?? '';
+        const limit = opts?.limit ?? 1000;
+        const cursor = opts?.cursor ?? '';
+        // Start at the deepest folder the prefix names, so listing `a/b/`
+        // doesn't walk the rest of the bucket.
+        const start = zoneKeyOf(prefix.slice(0, prefix.lastIndexOf('/') + 1));
+        const matching: Array<{ key: string; obj: BunnyObject }> = [];
+        for await (const files of walk(raw, start, opts?.signal)) {
+          for (const { zoneKey, obj } of files) {
+            const key = zoneKey.slice(base.length);
+            if (key.startsWith(prefix) && key > cursor && !isInternalKey(key)) {
+              matching.push({ key, obj });
+            }
+          }
+        }
+        matching.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+        const page = matching.slice(0, limit);
+        const items = page.map(({ key, obj }) => toMeta(obj, key));
+        const last = page[page.length - 1];
+        return matching.length > limit && last !== undefined
+          ? { items, cursor: last.key }
+          : { items };
+      }),
+
+    delete: (key, opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        // 404 is a no-op, matching S3 and fs.
+        await send(raw, 'DELETE', zoneKeyOf(key), {
+          signal: opts?.signal,
+          allowNotFound: true,
+        });
+      }),
+
+    copy: (from, to, opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        await copyObject(raw, zoneKeyOf(from), zoneKeyOf(to), opts?.signal);
+      }),
+
+    move: (from, to, opts) =>
+      mapped(async () => {
+        checkSignal(opts?.signal);
+        // Copy, then delete. Not atomic: a failure after the copy can
+        // leave both keys. The `move` contract allows this.
+        await copyObject(raw, zoneKeyOf(from), zoneKeyOf(to), opts?.signal);
+        await send(raw, 'DELETE', zoneKeyOf(from), {
+          signal: opts?.signal,
+          allowNotFound: true,
+        });
+      }),
+
+    async url(key, opts): Promise<string> {
+      checkSignal(opts?.signal);
+      // Public reads go through a linked Pull Zone. Without one, return
+      // the storage URL, which needs the `AccessKey` header to fetch.
+      return raw.pullZone
+        ? `https://${raw.pullZone}/${encodePath(zoneKeyOf(key))}`
+        : storageUrl(raw, zoneKeyOf(key));
+    },
+
+    async uploadUrl(): Promise<never> {
+      throw new StorageError({
+        code: 'NotSupported',
+        message:
+          'bunny adapter: uploadUrl is not supported (Bunny Edge Storage has no presigned upload URL).',
+      });
+    },
+
+    ...siblings<BunnyRaw>(
+      {
+        at: (name) => impl(raw, name),
+        inUse: (prefix, signal) => inUse(raw, prefix, signal),
+        copyAll: (from, to, signal) => copyAll(raw, from, to, signal),
+        destroy: (prefix, signal) => destroy(raw, prefix, signal),
+        asStorageError,
+      },
+      bucket
+    ),
+  };
 }

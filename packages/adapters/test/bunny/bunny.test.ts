@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { bunny } from '../../src/bunny/bunny.js';
 import { storageAdapterTestSuite } from '../../src/test-suite.js';
 
-// Live tests against a real Bunny storage zone. Skip the whole suite when
+// Live tests against a real Bunny storage zone. The suite is skipped when
 // the required env vars are missing or empty. `accessKey` is the storage
-// zone *password*, not the account API key.
+// zone password, not the account API key.
 const ZONE = process.env.BUNNY_STORAGE_ZONE;
 const ACCESS_KEY = process.env.BUNNY_STORAGE_ACCESS_KEY;
 const BUCKET = process.env.BUNNY_STORAGE_BUCKET ?? 'storagesdk-test';
@@ -40,7 +40,7 @@ storageAdapterTestSuite({
     fetchableSignedUrls: Boolean(PULL_ZONE),
   },
   // Bunny has no server-side copy, so snapshot/fork seeding and copy/move
-  // stream bytes per object — give the network-bound tests more headroom.
+  // send every object's bytes through the client, so allow more time.
   testTimeoutMs: 30_000,
 });
 

@@ -4,7 +4,7 @@ import { bunnyS3 } from '../../src/bunny-s3/bunny-s3.js';
 import { storageAdapterTestSuite } from '../../src/test-suite.js';
 
 // Live tests against a real Bunny storage zone created with S3
-// compatibility turned on. Skip the whole suite when the required env
+// compatibility turned on. The suite is skipped when the required env
 // vars are missing or empty. `accessKey` is the storage zone password.
 const ZONE = process.env.BUNNY_S3_ZONE;
 const ACCESS_KEY = process.env.BUNNY_S3_ACCESS_KEY;
@@ -27,6 +27,14 @@ storageAdapterTestSuite({
   name: 'bunny-s3 adapter',
   skip: !configured,
   adapter: buildAdapter,
+});
+
+describe('bunny-s3 adapter (config)', () => {
+  it.each(['', '.', '..', 'a/b'])('rejects bucket %j', (bucket) => {
+    expect(() => bunnyS3({ zone: 'zone', bucket, accessKey: 'key' })).toThrow(
+      expect.objectContaining({ code: 'InvalidArgument' })
+    );
+  });
 });
 
 if (configured) {

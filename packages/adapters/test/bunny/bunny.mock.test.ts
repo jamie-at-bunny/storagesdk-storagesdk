@@ -13,7 +13,7 @@ import { bunny } from '../../src/bunny/bunny.js';
 import { storageAdapterTestSuite } from '../../src/test-suite.js';
 
 // Runs the conformance suite against an in-memory stand-in for the Bunny
-// Edge Storage HTTP API, so the adapter is exercised without credentials.
+// Edge Storage HTTP API, so it runs without credentials.
 // The live suite in `bunny.test.ts` covers the real service.
 const ENDPOINT = 'https://storage.bunny.mock';
 const ZONE = 'mock-zone';
@@ -28,6 +28,14 @@ interface Entry {
 const files = new Map<string, Entry>();
 /** Every request the mock served, as `METHOD zone-relative-key`. */
 const requests: string[] = [];
+/** Body of every PUT, so tests can check streams are passed through. */
+const putBodies: unknown[] = [];
+/**
+ * Lets a test fail or intercept a request. Return a `Response` to answer
+ * it instead of the mock; throw to make `fetch` reject.
+ */
+let intercept: ((method: string, key: string) => Response | undefined) | null =
+  null;
 
 const describeEntry = (name: string, entry: Entry) => ({
   ObjectName: name,
@@ -81,11 +89,17 @@ async function handle(url: URL, init: RequestInit): Promise<Response> {
   const isDirectory = key === '' || key.endsWith('/');
   const entry = files.get(key);
   requests.push(`${init.method} ${key}`);
+  const intercepted = intercept?.(init.method ?? 'GET', key);
+  if (intercepted) return intercepted;
 
   switch (init.method) {
     case 'PUT': {
-      // The adapter always sends a `Uint8Array` body.
-      const bytes = new Uint8Array(init.body as Uint8Array);
+      putBodies.push(init.body);
+      const bytes = new Uint8Array(
+        await new Response(
+          init.body as ConstructorParameters<typeof Response>[0]
+        ).arrayBuffer()
+      );
       files.set(key, {
         bytes,
         contentType:
@@ -129,11 +143,12 @@ async function handle(url: URL, init: RequestInit): Promise<Response> {
 const realFetch = globalThis.fetch;
 
 beforeAll(() => {
-  vi.stubGlobal('fetch', (input: string | URL, init?: RequestInit) => {
+  vi.stubGlobal('fetch', async (input: string | URL, init?: RequestInit) => {
     const url = new URL(input);
-    return url.origin === ENDPOINT
-      ? handle(url, init ?? {})
-      : realFetch(input, init);
+    if (url.origin !== ENDPOINT) return realFetch(input, init);
+    // Like real `fetch`, refuse to start a request on an aborted signal.
+    init?.signal?.throwIfAborted();
+    return handle(url, init ?? {});
   });
 });
 
@@ -170,6 +185,8 @@ describe('bunny adapter (implementation)', () => {
   beforeEach(() => {
     files.clear();
     requests.length = 0;
+    putBodies.length = 0;
+    intercept = null;
   });
 
   it('stores each bucket under its own key prefix', async () => {
@@ -293,5 +310,140 @@ describe('bunny adapter (implementation)', () => {
     await one.forks.delete('two');
     await one.snapshots.delete('two');
     expect(files.has('two/keep.txt')).toBe(true);
+  });
+
+  it('requires an access key', () => {
+    expect(() =>
+      bunny({ zone: ZONE, bucket: 'one', accessKey: '', endpoint: ENDPOINT })
+    ).toThrow(StorageError);
+  });
+
+  it.each(['', '.', '..', 'a/b'])('rejects bucket %j', (bucket) => {
+    expect(() => build(bucket)).toThrow(
+      expect.objectContaining({ code: 'InvalidArgument' })
+    );
+  });
+
+  it.each([
+    '',
+    '..',
+    'one/inside',
+  ])('forks.create rejects name %j and leaves nothing behind', async (name) => {
+    const one = build('one');
+    await one.upload('a.txt', 'a');
+    await expect(one.forks.create({ name })).rejects.toMatchObject({
+      code: 'InvalidArgument',
+    });
+    // `defineAdapter` takes a base snapshot first; it's rolled back.
+    expect([...files.keys()].filter((k) => !k.startsWith('one/'))).toEqual([]);
+    expect(files.has('one/inside/a.txt')).toBe(false);
+    expect(await one.snapshots.list()).toEqual([]);
+    expect(() => one.forks.get(name)).toThrow(StorageError);
+  });
+
+  it('streams a ReadableStream upload instead of buffering it', async () => {
+    const chunks = ['hello ', 'stream'];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(c));
+        controller.close();
+      },
+    });
+    const meta = await build('one').upload('s.txt', body, {
+      contentType: 'text/plain',
+    });
+    expect(meta.size).toBe(12);
+    expect(putBodies[0]).toBeInstanceOf(ReadableStream);
+    expect(new TextDecoder().decode(files.get('one/s.txt')?.bytes)).toBe(
+      'hello stream'
+    );
+  });
+
+  it('copy streams the source into the destination', async () => {
+    const one = build('one');
+    await one.upload('a.txt', 'abc', { contentType: 'text/plain' });
+    putBodies.length = 0;
+    await one.copy('a.txt', 'b.txt');
+    expect(putBodies[0]).toBeInstanceOf(ReadableStream);
+    expect(files.get('one/b.txt')?.contentType).toBe('text/plain');
+  });
+
+  it('removes a partial snapshot when create is aborted mid-copy', async () => {
+    const one = build('one');
+    await one.upload('a.txt', 'a');
+    await one.upload('sub/b.txt', 'b');
+    // Abort once the top level is copied; the walk into `sub/` then fails.
+    const controller = new AbortController();
+    intercept = (method, key) => {
+      if (method === 'PUT' && key.startsWith('one-snapshot-')) {
+        controller.abort();
+      }
+      return undefined;
+    };
+
+    await expect(
+      one.snapshots.create({ signal: controller.signal })
+    ).rejects.toMatchObject({ code: 'Aborted' });
+    intercept = null;
+    expect(
+      [...files.keys()].filter((k) => k.startsWith('one-snapshot-'))
+    ).toEqual([]);
+    expect(await one.snapshots.list()).toEqual([]);
+  });
+
+  it('removes a partial fork when the copy fails', async () => {
+    const one = build('one');
+    await one.upload('a.txt', 'a');
+    await one.upload('b.txt', 'b');
+    let puts = 0;
+    intercept = (method, key) =>
+      method === 'PUT' && key.startsWith('feature/') && ++puts === 2
+        ? new Response(null, { status: 500 })
+        : undefined;
+
+    await expect(one.forks.create({ name: 'feature' })).rejects.toMatchObject({
+      code: 'Provider',
+    });
+    intercept = null;
+    expect([...files.keys()].filter((k) => k.startsWith('feature/'))).toEqual(
+      []
+    );
+    expect(await one.forks.list()).toEqual([]);
+  });
+
+  it('keeps a snapshot listed when deleting its data fails', async () => {
+    const one = build('one');
+    await one.upload('a.txt', 'a');
+    const snap = await one.snapshots.create();
+    intercept = (method, key) =>
+      method === 'DELETE' && key === `${snap.id}/`
+        ? new Response(null, { status: 500 })
+        : undefined;
+
+    await expect(one.snapshots.delete(snap.id)).rejects.toMatchObject({
+      code: 'Provider',
+    });
+    expect((await one.snapshots.list()).map((s) => s.id)).toEqual([snap.id]);
+    expect(files.has(`${snap.id}/a.txt`)).toBe(true);
+
+    intercept = null;
+    await one.snapshots.delete(snap.id);
+    expect(await one.snapshots.list()).toEqual([]);
+    expect(files.has(`${snap.id}/a.txt`)).toBe(false);
+  });
+
+  it('keeps a fork listed when deleting its data fails', async () => {
+    const one = build('one');
+    await one.upload('a.txt', 'a');
+    await one.forks.create({ name: 'feature' });
+    intercept = (method, key) =>
+      method === 'DELETE' && key === 'feature/'
+        ? new Response(null, { status: 403 })
+        : undefined;
+
+    await expect(one.forks.delete('feature')).rejects.toMatchObject({
+      code: 'Unauthorized',
+    });
+    expect((await one.forks.list()).map((f) => f.name)).toEqual(['feature']);
   });
 });

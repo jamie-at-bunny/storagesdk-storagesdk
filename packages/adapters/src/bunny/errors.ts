@@ -7,8 +7,8 @@ import {
 /**
  * Thrown by the adapter's transport helpers when a Bunny Edge Storage
  * response is not `ok`. Carries the HTTP `status` so `asStorageError` can
- * map it to a normalized `StorageError` code — the Bunny API returns no
- * machine-readable error body, just the status.
+ * map it to a `StorageError` code. The Bunny API returns no error body
+ * worth parsing, only the status.
  */
 export class BunnyHttpError extends Error {
   readonly status: number;
@@ -21,10 +21,10 @@ export class BunnyHttpError extends Error {
 
 /**
  * Map a Bunny transport error into a `StorageError`. Bunny Edge Storage
- * signals everything through the HTTP status: 404 → `NotFound`, 401/403 →
- * `Unauthorized`, 409 → `Conflict`, other 4xx → `InvalidArgument`,
- * anything else → `fallback` (`Provider` by default). Aborted fetches
- * surface as `Aborted`.
+ * reports errors only through the HTTP status. 404 is `NotFound`, 401 and
+ * 403 are `Unauthorized`, 409 is `Conflict`, other 4xx are
+ * `InvalidArgument`, and anything else is `fallback` (`Provider` by
+ * default). Aborted fetches become `Aborted`.
  */
 export function asStorageError(
   err: unknown,

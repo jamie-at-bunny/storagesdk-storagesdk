@@ -5,14 +5,14 @@ import {
   isInternalKey,
   type StorageItemMeta,
 } from '@storagesdk/core/adapter';
-import { siblings } from '../bunny/siblings.js';
+import { assertLocation, inBatches, siblings } from '../bunny/siblings.js';
 import { asStorageError } from '../s3/errors.js';
 import { s3 } from '../s3/s3.js';
 
 export interface BunnyS3Config {
   /**
    * Storage zone name. The zone must have been created with S3
-   * compatibility turned on — it can't be enabled afterwards. On the S3
+   * compatibility turned on, which can't be enabled later. On the S3
    * API the zone name is both the bucket and the access key id.
    */
   zone: string;
@@ -21,8 +21,9 @@ export interface BunnyS3Config {
    * the adapter can't create sibling zones for snapshots and forks.
    * Instead it maps each storagesdk "bucket" to a key prefix
    * (`<bucket>/<key>`) inside the zone, and snapshots/forks live as
-   * sibling prefixes — the same layout the `bunny` adapter uses, so both
-   * adapters can work on the same zone.
+   * sibling prefixes. The `bunny` adapter uses the same layout, so both
+   * adapters can work on the same zone. Must be a single path segment
+   * (no `/`).
    */
   bucket: string;
   /**
@@ -44,10 +45,6 @@ export interface BunnyS3Config {
   endpoint?: string;
 }
 
-// Server-side copies and deletes issued at once while seeding or removing
-// a snapshot/fork prefix. Well under Bunny's 500 requests/second limit.
-const CONCURRENCY = 16;
-
 /**
  * Adapter for Bunny Storage over its S3-compatible API.
  *
@@ -58,12 +55,12 @@ const CONCURRENCY = 16;
  * shared with the `bunny` adapter rather than the S3 adapter's sibling
  * buckets, because a zone's credentials can't create another zone.
  *
- * Bunny defaults the adapter sets for you:
- *  - Endpoint built from `region`; override with `endpoint`.
- *  - `forcePathStyle: true`.
- *  - `requestChecksumCalculation: 'WHEN_REQUIRED'`.
+ * The adapter builds the endpoint from `region` (override it with
+ * `endpoint`) and sets `forcePathStyle: true` and
+ * `requestChecksumCalculation: 'WHEN_REQUIRED'`, which Bunny needs.
  */
 export function bunnyS3(config: BunnyS3Config): Adapter<S3Client> {
+  assertLocation('bunny-s3 adapter: bucket', config.bucket);
   const region = config.region ?? 'de';
   const zone = s3({
     bucket: config.zone,
@@ -77,16 +74,6 @@ export function bunnyS3(config: BunnyS3Config): Adapter<S3Client> {
     },
   });
   return defineAdapter<S3Client>(impl(zone, config.bucket));
-}
-
-/** Run `fn` over `items`, at most `CONCURRENCY` at a time. */
-async function inBatches<T>(
-  items: readonly T[],
-  fn: (item: T) => Promise<void>
-): Promise<void> {
-  for (let i = 0; i < items.length; i += CONCURRENCY) {
-    await Promise.all(items.slice(i, i + CONCURRENCY).map(fn));
-  }
 }
 
 /** Every key under `prefix`, one page at a time. */
@@ -109,7 +96,7 @@ async function* pages(
 
 /**
  * Copy every object under `from/` to `to/` with server-side `CopyObject`,
- * skipping the manifest — the destination writes its own.
+ * skipping the manifest since the destination writes its own.
  */
 async function copyAll(
   zone: Adapter<S3Client>,
@@ -132,21 +119,29 @@ async function copyAll(
   }
 }
 
-/**
- * Delete everything under `prefix/`. Best-effort: used for snapshot/fork
- * teardown and create-failure rollback.
- */
+/** Whether anything, including a manifest, is stored under `prefix/`. */
+async function inUse(
+  zone: Adapter<S3Client>,
+  prefix: string,
+  signal: AbortSignal | undefined
+): Promise<boolean> {
+  const page = await zone.list({
+    prefix: `${prefix}/`,
+    limit: 1,
+    ...(signal ? { signal } : {}),
+  });
+  return page.items.length > 0;
+}
+
+/** Delete everything under `prefix/`. */
 async function destroy(
   zone: Adapter<S3Client>,
   prefix: string,
   signal: AbortSignal | undefined
 ): Promise<void> {
-  try {
-    for await (const keys of pages(zone, `${prefix}/`, signal)) {
-      await inBatches(keys, (key) => zone.delete(key));
-    }
-  } catch {
-    /* best-effort */
+  const opts = signal ? { signal } : undefined;
+  for await (const keys of pages(zone, `${prefix}/`, signal)) {
+    await inBatches(keys, (key) => zone.delete(key, opts));
   }
 }
 
@@ -197,6 +192,7 @@ function impl(zone: Adapter<S3Client>, bucket: string): Adapter<S3Client> {
     ...siblings<S3Client>(
       {
         at: (name) => impl(zone, name),
+        inUse: (prefix, signal) => inUse(zone, prefix, signal),
         copyAll: (from, to, signal) => copyAll(zone, from, to, signal),
         destroy: (prefix, signal) => destroy(zone, prefix, signal),
         asStorageError,
