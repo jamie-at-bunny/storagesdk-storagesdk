@@ -1,4 +1,8 @@
-import { DeleteObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  type ListObjectsV2CommandOutput,
+} from '@aws-sdk/client-s3';
 import { afterAll, describe, expect, it } from 'vitest';
 import { bunnyS3 } from '../../src/bunny-s3/bunny-s3.js';
 import { storageAdapterTestSuite } from '../../src/test-suite.js';
@@ -13,6 +17,13 @@ const REGION = process.env.BUNNY_S3_REGION;
 const ENDPOINT = process.env.BUNNY_S3_ENDPOINT;
 
 const configured = Boolean(ZONE && ACCESS_KEY);
+
+// Bunny's S3 API lists each subfolder as a key ending in `/`. Drop those
+// so assertions only see objects.
+const objectKeys = (out: ListObjectsV2CommandOutput): string[] =>
+  (out.Contents ?? [])
+    .map((o) => o.Key ?? '')
+    .filter((key) => !key.endsWith('/'));
 
 const buildAdapter = () =>
   bunnyS3({
@@ -78,9 +89,7 @@ if (configured) {
       const out = await one.raw.send(
         new ListObjectsV2Command({ Bucket: ZONE as string, Prefix: run })
       );
-      expect((out.Contents ?? []).map((o) => o.Key)).toEqual([
-        `${run}-one/a/b.txt`,
-      ]);
+      expect(objectKeys(out)).toEqual([`${run}-one/a/b.txt`]);
       expect((await one.head('a/b.txt')).metadata).toEqual({ owner: 'me' });
       expect((await two.list()).items).toEqual([]);
     });
@@ -94,7 +103,7 @@ if (configured) {
           Prefix: `${snap.id}/`,
         })
       );
-      expect((out.Contents ?? []).map((o) => o.Key).sort()).toEqual([
+      expect(objectKeys(out).sort()).toEqual([
         `${snap.id}/.storagesdk.metadata.json`,
         `${snap.id}/a/b.txt`,
       ]);

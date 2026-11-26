@@ -76,7 +76,14 @@ export function bunnyS3(config: BunnyS3Config): Adapter<S3Client> {
   return defineAdapter<S3Client>(impl(zone, config.bucket));
 }
 
-/** Every key under `prefix`, one page at a time. */
+/**
+ * Bunny's S3 API lists every subfolder as a zero-byte key ending in `/`,
+ * and keeps it after the folder's files are deleted. These keys aren't
+ * objects: they can't be copied, and callers shouldn't see them.
+ */
+const isFolderKey = (key: string): boolean => key.endsWith('/');
+
+/** Every key under `prefix`, folder keys included, one page at a time. */
 async function* pages(
   zone: Adapter<S3Client>,
   prefix: string,
@@ -107,6 +114,7 @@ async function copyAll(
   const fromPrefix = `${from}/`;
   for await (const keys of pages(zone, fromPrefix, signal)) {
     const relative = keys
+      .filter((key) => !isFolderKey(key))
       .map((key) => key.slice(fromPrefix.length))
       .filter((key) => !isInternalKey(key));
     await inBatches(relative, (key) =>
@@ -119,21 +127,25 @@ async function copyAll(
   }
 }
 
-/** Whether anything, including a manifest, is stored under `prefix/`. */
+/**
+ * Whether any object, including a manifest, is stored under `prefix/`.
+ * Empty folder keys left behind by earlier deletes don't count.
+ */
 async function inUse(
   zone: Adapter<S3Client>,
   prefix: string,
   signal: AbortSignal | undefined
 ): Promise<boolean> {
-  const page = await zone.list({
-    prefix: `${prefix}/`,
-    limit: 1,
-    ...(signal ? { signal } : {}),
-  });
-  return page.items.length > 0;
+  for await (const keys of pages(zone, `${prefix}/`, signal)) {
+    if (keys.some((key) => !isFolderKey(key))) return true;
+  }
+  return false;
 }
 
-/** Delete everything under `prefix/`. */
+/**
+ * Delete everything under `prefix/`, including folder keys, so nothing is
+ * left listed in the zone.
+ */
 async function destroy(
   zone: Adapter<S3Client>,
   prefix: string,
@@ -173,9 +185,10 @@ function impl(zone: Adapter<S3Client>, bucket: string): Adapter<S3Client> {
         ...opts,
         prefix: zoneKey(opts?.prefix ?? ''),
       });
-      // The manifest is an object under this prefix, so filtering it can
-      // leave one page short by one item.
+      // The manifest and folder keys are filtered out, so a page can come
+      // back shorter than `limit`.
       const items = page.items
+        .filter((item) => !isFolderKey(item.path))
         .map(strip)
         .filter((item) => !isInternalKey(item.path));
       return page.cursor !== undefined
