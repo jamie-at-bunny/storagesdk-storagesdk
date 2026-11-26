@@ -44,13 +44,21 @@ export interface SiblingTransport<Raw> {
 // snapshot/fork prefix. Well under Bunny's 500 requests/second limit.
 const CONCURRENCY = 16;
 
-/** Run `fn` over `items`, at most `CONCURRENCY` at a time. */
+/**
+ * Run `fn` over `items`, at most `CONCURRENCY` at a time. If a call fails,
+ * the rest of its batch still runs to completion before the first error is
+ * thrown, so nothing is still writing when the caller cleans up.
+ */
 export async function inBatches<T>(
   items: readonly T[],
   fn: (item: T) => Promise<void>
 ): Promise<void> {
   for (let i = 0; i < items.length; i += CONCURRENCY) {
-    await Promise.all(items.slice(i, i + CONCURRENCY).map(fn));
+    const results = await Promise.allSettled(
+      items.slice(i, i + CONCURRENCY).map(fn)
+    );
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed) throw failed.reason;
   }
 }
 

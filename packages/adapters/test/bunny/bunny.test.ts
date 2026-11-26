@@ -55,23 +55,32 @@ if (configured) {
     const { endpoint, zone, accessKey } = buildAdapter().raw;
     const url = (dir: string) => `${endpoint}/${zone}/${encodeURI(dir)}`;
     const headers = { AccessKey: accessKey, Accept: 'application/json' };
+    // `null` when the listing fails, so the folder isn't mistaken for empty.
     const entries = async (dir: string) => {
-      const res = await fetch(url(dir), { headers });
-      return res.ok
-        ? ((await res.json()) as Array<{
-            ObjectName: string;
-            IsDirectory: boolean;
-          }>)
-        : [];
+      const res = await fetch(url(dir), { headers }).catch(() => null);
+
+      if (!res?.ok) return null;
+
+      return (await res.json()) as Array<{
+        ObjectName: string;
+        IsDirectory: boolean;
+      }>;
     };
+    // A folder DELETE is recursive, so anything that can't be listed counts
+    // as holding files and is kept.
     const hasFiles = async (dir: string): Promise<boolean> => {
-      for (const e of await entries(dir)) {
+      const list = await entries(dir);
+
+      if (list === null) return true;
+
+      for (const e of list) {
         if (!e.IsDirectory) return true;
         if (await hasFiles(`${dir}${e.ObjectName}/`)) return true;
       }
       return false;
     };
-    for (const e of await entries(`${BUCKET}/`)) {
+
+    for (const e of (await entries(`${BUCKET}/`)) ?? []) {
       const dir = `${BUCKET}/${e.ObjectName}/`;
       if (e.IsDirectory && !(await hasFiles(dir))) {
         await fetch(url(dir), { method: 'DELETE', headers });

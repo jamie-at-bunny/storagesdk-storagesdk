@@ -34,8 +34,12 @@ const putBodies: unknown[] = [];
  * Lets a test fail or intercept a request. Return a `Response` to answer
  * it instead of the mock; throw to make `fetch` reject.
  */
-let intercept: ((method: string, key: string) => Response | undefined) | null =
-  null;
+let intercept:
+  | ((
+      method: string,
+      key: string
+    ) => Response | undefined | Promise<Response | undefined>)
+  | null = null;
 
 const describeEntry = (name: string, entry: Entry) => ({
   ObjectName: name,
@@ -89,7 +93,7 @@ async function handle(url: URL, init: RequestInit): Promise<Response> {
   const isDirectory = key === '' || key.endsWith('/');
   const entry = files.get(key);
   requests.push(`${init.method} ${key}`);
-  const intercepted = intercept?.(init.method ?? 'GET', key);
+  const intercepted = await intercept?.(init.method ?? 'GET', key);
   if (intercepted) return intercepted;
 
   switch (init.method) {
@@ -409,6 +413,31 @@ describe('bunny adapter (implementation)', () => {
       []
     );
     expect(await one.forks.list()).toEqual([]);
+  });
+
+  it('waits for in-flight copies before removing a failed fork', async () => {
+    const one = build('one');
+    await one.upload('fail.txt', 'a');
+    await one.upload('slow.txt', 'b');
+    // `fail.txt` fails at once; `slow.txt` from the same batch lands later.
+    intercept = async (method, key) => {
+      if (method !== 'PUT') return undefined;
+      if (key === 'feature/fail.txt')
+        return new Response(null, { status: 500 });
+      if (key === 'feature/slow.txt') {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return undefined;
+    };
+
+    await expect(one.forks.create({ name: 'feature' })).rejects.toMatchObject({
+      code: 'Provider',
+    });
+    intercept = null;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect([...files.keys()].filter((k) => k.startsWith('feature/'))).toEqual(
+      []
+    );
   });
 
   it('keeps a snapshot listed when deleting its data fails', async () => {
