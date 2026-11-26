@@ -80,7 +80,7 @@ If a snapshot or fork fails partway (including when it's aborted), the partial c
 
 - **Custom metadata.** Bunny Edge Storage has no user-metadata field. `upload({ metadata })` silently drops the metadata. Use a sidecar object if you need per-object metadata.
 - **Presigned uploads.** Bunny has no presigned upload URL. `uploadUrl()` throws `StorageError` with code `NotSupported`.
-- **Server-side paging.** Bunny's directory listing returns a whole folder at a time with no pagination, so every `list()` call walks every folder under the prefix and then slices out one page. Paging through a large bucket costs one walk per page. Pass the narrowest `prefix` you can; a prefix ending in `/` starts the walk at that folder.
+- **Server-side paging.** Bunny's directory listing returns a whole folder at a time with no pagination, so every `list()` call walks every folder under the prefix and then slices out one page. Paging through a large bucket costs one walk per page. Pass the narrowest `prefix` you can; a prefix ending in `/` starts the walk at that folder. Edge Storage also keeps a folder after its last file is deleted, and `list()` still has to open it, so a bucket where many folders have been emptied lists more slowly. The adapter doesn't remove empty folders itself: a folder DELETE on Bunny is recursive, so a file uploaded between the check and the delete would be lost.
 
 ## URLs
 

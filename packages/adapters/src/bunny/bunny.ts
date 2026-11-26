@@ -27,6 +27,9 @@ export type BunnyRegion =
   | 'jh'
   | 'syd';
 
+// Kept in step with `regions.StorageRegion` and `regions.addr` in
+// `@bunny.net/storage-sdk`. Check there when adding a region. It isn't
+// imported, so this adapter has no dependencies.
 const REGION_HOSTS: Readonly<Record<BunnyRegion, string>> = {
   de: 'storage.bunnycdn.com',
   uk: 'uk.storage.bunnycdn.com',

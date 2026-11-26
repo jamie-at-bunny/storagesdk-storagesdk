@@ -38,6 +38,9 @@ storageAdapterTestSuite({
   name: 'bunny-s3 adapter',
   skip: !configured,
   adapter: buildAdapter,
+  // Also raises the cleanup hooks' 10 second default, which slow network
+  // round-trips to Bunny can exceed.
+  testTimeoutMs: 30_000,
 });
 
 describe('bunny-s3 adapter (config)', () => {

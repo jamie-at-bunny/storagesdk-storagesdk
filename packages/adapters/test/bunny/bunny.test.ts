@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { bunny } from '../../src/bunny/bunny.js';
 import { storageAdapterTestSuite } from '../../src/test-suite.js';
 
@@ -41,8 +41,44 @@ storageAdapterTestSuite({
   },
   // Bunny has no server-side copy. Snapshot/fork seeding and copy/move
   // send every object's bytes through the client and need more time.
-  testTimeoutMs: 30_000,
+  testTimeoutMs: 60_000,
 });
+
+// Edge Storage keeps a folder after its last file is deleted, and `list`
+// has to request every folder. Each test writes under its own prefix, so
+// without this every run would leave dozens of empty folders behind and
+// later runs would list more and more slowly. Remove the folders under the
+// test bucket that hold no files. A run sharing the bucket could race
+// this, as with the diff-based cleanup.
+if (configured) {
+  afterAll(async () => {
+    const { endpoint, zone, accessKey } = buildAdapter().raw;
+    const url = (dir: string) => `${endpoint}/${zone}/${encodeURI(dir)}`;
+    const headers = { AccessKey: accessKey, Accept: 'application/json' };
+    const entries = async (dir: string) => {
+      const res = await fetch(url(dir), { headers });
+      return res.ok
+        ? ((await res.json()) as Array<{
+            ObjectName: string;
+            IsDirectory: boolean;
+          }>)
+        : [];
+    };
+    const hasFiles = async (dir: string): Promise<boolean> => {
+      for (const e of await entries(dir)) {
+        if (!e.IsDirectory) return true;
+        if (await hasFiles(`${dir}${e.ObjectName}/`)) return true;
+      }
+      return false;
+    };
+    for (const e of await entries(`${BUCKET}/`)) {
+      const dir = `${BUCKET}/${e.ObjectName}/`;
+      if (e.IsDirectory && !(await hasFiles(dir))) {
+        await fetch(url(dir), { method: 'DELETE', headers });
+      }
+    }
+  }, 120_000);
+}
 
 if (!configured) {
   describe('bunny adapter (skipped)', () => {
