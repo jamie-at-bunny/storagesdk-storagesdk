@@ -39,8 +39,8 @@ storageAdapterTestSuite({
     // `url()` is publicly fetchable only when a pull zone is configured.
     fetchableSignedUrls: Boolean(PULL_ZONE),
   },
-  // Bunny has no server-side copy, so snapshot/fork seeding and copy/move
-  // send every object's bytes through the client, so allow more time.
+  // Bunny has no server-side copy. Snapshot/fork seeding and copy/move
+  // send every object's bytes through the client and need more time.
   testTimeoutMs: 30_000,
 });
 

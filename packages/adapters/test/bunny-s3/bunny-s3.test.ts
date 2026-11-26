@@ -49,7 +49,9 @@ describe('bunny-s3 adapter (config)', () => {
 });
 
 if (configured) {
-  describe('bunny-s3 adapter (implementation)', () => {
+  // Each forks.create takes and rolls back a base snapshot over the
+  // network, which can run past vitest's 5 second default.
+  describe('bunny-s3 adapter (implementation)', { timeout: 30_000 }, () => {
     // Two logical buckets in the same zone, unique per run.
     const run = `impl-${Date.now().toString(36)}`;
     const build = (bucket: string) =>
